@@ -328,13 +328,14 @@ export class OKX {
                 method: "GET",
                 params: {
                     ccy: "BTC",
-                    amt: toDecimal(amount, 8)
+                    amt: toDecimal(amount, 8),
+                    to: "18"
                 }
             });
 
             //TODO: Check if an invoice with valid amount was returned
 
-            return resp.data.invoice;
+            return resp.data[0].invoice;
         }
 
         const resp = await this.call({

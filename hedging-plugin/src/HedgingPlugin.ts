@@ -1,7 +1,7 @@
 
 import {FromBtcAbs, FromBtcLnAbs, FromBtcLnSwapState, FromBtcSwapState, IPlugin,
     ISwapPrice,
-    SwapHandler, SwapHandlerSwap} from "crosslightning-intermediary";
+    SwapHandler, SwapHandlerSwap, ToBtcAbs, ToBtcLnAbs, ToBtcLnSwapState, ToBtcSwapState} from "crosslightning-intermediary";
 import {BitcoinRpc, BtcBlock, BtcRelay, ChainEvents, SwapContract, SwapData} from "crosslightning-base";
 import {AuthenticatedLnd} from "lightning";
 import {RESTv2} from 'bitfinex-api-node';
@@ -13,6 +13,7 @@ import * as fs from "fs/promises";
 import {randomBytes} from "crypto";
 import * as bolt11 from "bolt11";
 import * as bitcoin from "bitcoinjs-lib";
+import {SwapHandlerType} from "crosslightning-intermediary";
 
 type TokenAddresses = {
     WBTC: string,
@@ -152,6 +153,8 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
 
     private fromBtcLn: FromBtcLnAbs<T>;
     private fromBtc: FromBtcAbs<T>;
+    private toBtcLn: ToBtcLnAbs<T>;
+    private toBtc: ToBtcAbs<T>;
 
     private swapContract: SwapContract<T, any>;
     private lnd: AuthenticatedLnd;
@@ -163,15 +166,34 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
 
     private btcDepositAddress: string;
 
-    constructor(apiKey: string, apiSecret: string, apiPassword: string, tokenAddresses: TokenAddresses, swapPricing: ISwapPrice, okxSmartChainName: string, bitcoinRpc: BitcoinRpc<BtcBlock>) {
+    private readonly rebalanceThresholdPPM: BN;
+    private readonly rebalanceAmountPPM: BN;
+
+    constructor(
+        apiKey: string,
+        apiSecret: string,
+        apiPassword: string,
+
+        tokenAddresses: TokenAddresses,
+        swapPricing: ISwapPrice,
+        okxSmartChainName: string,
+        bitcoinRpc: BitcoinRpc<BtcBlock>,
+
+        rebalanceThresholdPPM: BN,
+        rebalanceAmountPPM: BN
+    ) {
         this.apiKey = apiKey;
         this.apiSecret = apiSecret;
         this.apiPassword = apiPassword;
+
         this.tokenAddresses = tokenAddresses;
         this.tokenAddresses.ETH = "0x0000000000000000000000000000000000000000";
         this.swapPricing = swapPricing;
         this.okxSmartChainName = okxSmartChainName;
         this.bitcoinRpc = bitcoinRpc;
+
+        this.rebalanceThresholdPPM = rebalanceThresholdPPM;
+        this.rebalanceAmountPPM = rebalanceAmountPPM;
     }
 
     private state: HedgingPluginState;
@@ -189,15 +211,26 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
         } catch (e) {}
     }
 
-    async saveState() {
-        const stringified = JSON.stringify(this.state, (key: string, value: any) => {
+    serializeState(): string {
+        return JSON.stringify(this.state, (key: string, value: any) => {
             if(key==="amountOut" || key==="amountIn" || key==="withdrawalFee") {
                 return (value as BN).toString(10);
             }
             return value;
         });
+    }
+
+    async saveState() {
         //console.log("[Hedging plugin] Save state: ", this.state);
-        await fs.writeFile("storage/"+STATE_FILENAME, stringified);
+        await fs.writeFile("storage/"+STATE_FILENAME, this.serializeState());
+    }
+
+    async archiveState() {
+        try {
+            await fs.mkdir("storage/archive");
+        } catch (e) {}
+        await fs.writeFile("storage/archive/rebalance-"+Date.now()+".json", this.serializeState());
+        await fs.rm("storage/"+STATE_FILENAME);
     }
 
     async check() {
@@ -224,7 +257,7 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
                     this.state.cooldown = Date.now()+(5*1000);
                     await this.setState(RebalancingState.OUT_TX);
                     const payment = await lncli.pay({
-                        pr: destinationAddress,
+                        request: destinationAddress,
                         lnd: this.lnd
                     }).catch(e => {
                         console.error(e);
@@ -686,6 +719,11 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
         if(this.state.state===RebalancingState.SC_DEPOSITED) {
             await this.setState(RebalancingState.FINISHED);
         }
+
+        if(this.state.state===RebalancingState.FINISHED) {
+            await this.archiveState();
+            this.state = {state: null};
+        }
     }
 
     async setState(newState: RebalancingState) {
@@ -768,12 +806,18 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
         //await this.saveState();
 
         // this.state = {state: null};
-        // this.state.srcToken = "USDC";
-        // this.state.srcTokenAddress = this.tokenAddresses["USDC"];
-        // this.state.dstToken = "BTC";
-        // this.state.dstTokenAddress = "";
-        // this.state.amountOut = new BN("35000000000000000000");
+        // this.state.srcToken = "BTC-LN";
+        // this.state.srcTokenAddress = "";
+        // this.state.dstToken = "USDC";
+        // this.state.dstTokenAddress = this.tokenAddresses["USDC"];
+        // this.state.amountOut = new BN("100000");
         // await this.setState(RebalancingState.TRIGGERED);
+
+        // const addr = "lnbc180u1pj2cfc5pp54tkrpgqzzvxnvsm87x858pvzy5dampj3mz0x5wm2863reemwpucshp52r2anlhddfa9ex9vpw9gstxujff8a0p8s3pzvua930js0kwfea6scqzzsxqyz5vqsp56g3fp4uldkqyguqvj6cw7mja9lv20277nsd5ezjqt0f6mn9c4ays9qyyssq4umspymldceugwt4qlwl660g80zv4d2l4q0qudv3v0ke9h0h8wpsm0hfxp7cs6t4knahs9qvu0jwaasl5u6wlavzh4vv7sfq4gc4y5cqz087zn";
+        //
+        // const result = await this.okxV5Api.withdraw("BTC-LN", null, addr, "Lorem", null, null);
+        //
+        // console.log(result);
 
         // const apiResult = await okxV5Api.call({
         //     method: 'POST',
@@ -801,62 +845,170 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
         // console.log("order id: ", orderId);
         // console.log("apiResult: ", apiResult);
 
-        // setInterval(async () => {
-        //
-        //     const balanceUSDC = await swapContract.getBalance(swapContract.toTokenAddress(this.tokenAddresses.USDC), true);
-        //     const balanceUSDCinBTC = await this.swapPricing.getToBtcSwapAmount(balanceUSDC, swapContract.toTokenAddress(this.tokenAddresses.USDC));
-        //
-        //     const channelBalances = await lncli.getChannelBalance({lnd});
-        //     const balanceLightning = new BN(channelBalances.channel_balance_mtokens).div(new BN(1000));
-        //
-        //     const onchainBalances = await lncli.getChainBalance({lnd});
-        //     const balanceOnchain = new BN(onchainBalances.chain_balance);
-        //
-        //     console.log("Balance USDC: ", balanceUSDC.toString());
-        //     console.log("Balance USDC in BTC: ", balanceUSDCinBTC.toString());
-        //     console.log("Balance BTC-LN: ", balanceLightning.toString());
-        //     console.log("Balance BTC: ", balanceOnchain.toString());
-        //
-        //     const lockedBalances: Record<string, BN> = {}; //Balances locked in PTLCs and HTLCs
-        //     const returningBalances: Record<string, BN> = {}; //Balances that are just being refunded back to us
-        //
-        //     if(this.fromBtcLn!=null) {
-        //         for(let swapHash in this.fromBtcLn.storageManager.data) {
-        //             const swap = this.fromBtcLn.storageManager.data[swapHash];
-        //             if(swap.state===FromBtcLnSwapState.COMMITED) {
-        //                 if(lockedBalances[swap.data.getToken().toString()]==null) {
-        //                     lockedBalances[swap.data.getToken().toString()] = swap.data.getAmount();
-        //                 } else {
-        //                     lockedBalances[swap.data.getToken().toString()] = lockedBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
-        //                 }
-        //             }
-        //             if(swap.state===FromBtcLnSwapState.CANCELED && swap.data!=null) {
-        //                 if(returningBalances[swap.data.getToken().toString()]==null) {
-        //                     returningBalances[swap.data.getToken().toString()] = swap.data.getAmount();
-        //                 } else {
-        //                     returningBalances[swap.data.getToken().toString()] = returningBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
-        //                 }
-        //             }
-        //         }
-        //     }
-        //
-        //     if(this.fromBtc!=null) {
-        //         for(let swapHash in this.fromBtc.storageManager.data) {
-        //             const swap = this.fromBtc.storageManager.data[swapHash];
-        //             if(swap.state===FromBtcSwapState.COMMITED) {
-        //                 if(lockedBalances[swap.data.getToken().toString()]==null) {
-        //                     lockedBalances[swap.data.getToken().toString()] = swap.data.getAmount();
-        //                 } else {
-        //                     lockedBalances[swap.data.getToken().toString()] = lockedBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
-        //                 }
-        //             }
-        //         }
-        //     }
-        //
-        //     console.log("Locked balances: ", lockedBalances);
-        //     console.log("Returning balances: ", returningBalances);
-        //
-        // }, 15000);
+        setInterval(async () => {
+
+            if(this.state!=null && this.state.state!=null && this.state.state!==RebalancingState.IDLE) {
+                return;
+            }
+
+            let balanceUSDC = await swapContract.getBalance(swapContract.toTokenAddress(this.tokenAddresses.USDC), true);
+            const usableBalanceUSDC = balanceUSDC;
+
+            const lockedBalances: Record<string, BN> = {}; //Balances locked in PTLCs and HTLCs
+            const returningBalances: Record<string, BN> = {}; //Balances that are just being refunded back to us
+
+            if(this.fromBtcLn!=null) {
+                for(let swapHash in this.fromBtcLn.storageManager.data) {
+                    const swap = this.fromBtcLn.storageManager.data[swapHash];
+
+                    let isCommitted = false;
+                    if(swap.state===FromBtcLnSwapState.RECEIVED) {
+                        isCommitted = await this.swapContract.isCommited(swap.data);
+                    }
+                    if(swap.state===FromBtcLnSwapState.COMMITED) {
+                        isCommitted = true;
+                    }
+                    if(isCommitted) {
+                        if(lockedBalances[swap.data.getToken().toString()]==null) {
+                            lockedBalances[swap.data.getToken().toString()] = swap.data.getAmount();
+                        } else {
+                            lockedBalances[swap.data.getToken().toString()] = lockedBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
+                        }
+                    }
+
+                    if(swap.state===FromBtcLnSwapState.CANCELED && swap.data!=null) {
+                        if(returningBalances[swap.data.getToken().toString()]==null) {
+                            returningBalances[swap.data.getToken().toString()] = swap.data.getAmount();
+                        } else {
+                            returningBalances[swap.data.getToken().toString()] = returningBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
+                        }
+                    }
+                }
+            }
+
+            if(this.fromBtc!=null) {
+                // console.log("From btc!=null");
+                for(let swapHash in this.fromBtc.storageManager.data) {
+                    // console.log("Check swap hash: ", swapHash);
+                    const swap = this.fromBtc.storageManager.data[swapHash];
+                    let isCommitted = false;
+                    if(swap.state===FromBtcSwapState.CREATED) {
+                        //Check if committed in the meantime
+                        isCommitted = await this.swapContract.isCommited(swap.data);
+                    }
+                    if(swap.state===FromBtcSwapState.COMMITED) {
+                        isCommitted = true;
+                    }
+                    if(isCommitted) {
+                        if(lockedBalances[swap.data.getToken().toString()]==null) {
+                            lockedBalances[swap.data.getToken().toString()] = swap.data.getAmount();
+                        } else {
+                            lockedBalances[swap.data.getToken().toString()] = lockedBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
+                        }
+                    }
+                }
+            }
+
+            if(this.toBtc!=null) {
+                for(let swapHash in this.toBtc.storageManager.data) {
+                    const swap = this.toBtc.storageManager.data[swapHash];
+                    if(swap.state===ToBtcSwapState.BTC_SENT) {
+                        if(returningBalances[swap.data.getToken().toString()]==null) {
+                            returningBalances[swap.data.getToken().toString()] = swap.data.getAmount();
+                        } else {
+                            returningBalances[swap.data.getToken().toString()] = returningBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
+                        }
+                    }
+                }
+            }
+
+            if(this.toBtcLn!=null) {
+                for(let swapHash in this.toBtcLn.storageManager.data) {
+                    const swap = this.toBtcLn.storageManager.data[swapHash];
+                    if(swap.state===ToBtcLnSwapState.PAID) {
+                        if(returningBalances[swap.data.getToken().toString()]==null) {
+                            returningBalances[swap.data.getToken().toString()] = swap.data.getAmount();
+                        } else {
+                            returningBalances[swap.data.getToken().toString()] = returningBalances[swap.data.getToken().toString()].add(swap.data.getAmount());
+                        }
+                    }
+                }
+            }
+
+            console.log("Locked balances: ", lockedBalances);
+            console.log("Returning balances: ", returningBalances);
+
+            if(lockedBalances[this.tokenAddresses.USDC]!=null) {
+                balanceUSDC = balanceUSDC.add(lockedBalances[this.tokenAddresses.USDC]);
+            }
+
+            if(returningBalances[this.tokenAddresses.USDC]!=null) {
+                balanceUSDC = balanceUSDC.add(returningBalances[this.tokenAddresses.USDC]);
+            }
+
+            const balanceUSDCinBTC = await this.swapPricing.getToBtcSwapAmount(balanceUSDC, swapContract.toTokenAddress(this.tokenAddresses.USDC));
+
+            const channelBalances = await lncli.getChannelBalance({lnd});
+            const balanceLightning = new BN(channelBalances.channel_balance_mtokens).div(new BN(1000));
+
+            const onchainBalances = await lncli.getChainBalance({lnd});
+            const balanceOnchain = new BN(onchainBalances.chain_balance);
+
+            console.log("[Hedging plugin: Check pools] Balance USDC: ", balanceUSDC.toString());
+
+            // const sum = balanceUSDCinBTC.add(balanceLightning).add(balanceOnchain);
+            //
+            // console.log("Balance USDC in BTC: ", balanceUSDCinBTC.toString(), balanceUSDCinBTC.mul(new BN(1000)).div(sum).toString(10));
+            // console.log("Balance BTC-LN: ", balanceLightning.toString(), balanceLightning.mul(new BN(1000)).div(sum).toString(10));
+            // console.log("Balance BTC: ", balanceOnchain.toString(), balanceOnchain.mul(new BN(1000)).div(sum).toString(10));
+
+            //TODO: Leave out lightning for now
+
+            const sumOnChainAndUSDC = balanceUSDCinBTC.add(balanceOnchain);
+
+            const ppmUSDC = balanceUSDCinBTC.mul(new BN(1000000)).div(sumOnChainAndUSDC);
+            const ppmBTC = balanceOnchain.mul(new BN(1000000)).div(sumOnChainAndUSDC);
+
+            console.log("[Hedging plugin: Check pools] USDC: ", balanceUSDCinBTC.toString(10), ppmUSDC.toString(10));
+            console.log("[Hedging plugin: Check pools] BTC: ", balanceOnchain.toString(10), ppmBTC.toString(10));
+
+            const diffPPM = ppmUSDC.sub(ppmBTC);
+
+            if(diffPPM.abs().gt(this.rebalanceThresholdPPM)) {
+                const btcValueToSwap = sumOnChainAndUSDC.mul(diffPPM.abs()).mul(this.rebalanceAmountPPM).div(new BN(1000000)).div(new BN(1000000));
+                if(diffPPM.isNeg()) {
+                    //We have more BTC
+                    //Swap BTC
+                    console.log("[Hedging plugin: Check pools] Should initiate swap from BTC -> USDC, amount: ", btcValueToSwap.toString());
+
+                    this.state = {state: null};
+                    this.state.srcToken = "BTC";
+                    this.state.srcTokenAddress = "";
+                    this.state.dstToken = "USDC";
+                    this.state.dstTokenAddress = this.tokenAddresses["USDC"];
+                    this.state.amountOut = btcValueToSwap;
+                    await this.setState(RebalancingState.TRIGGERED);
+
+                } else {
+                    //We have more USDC
+                    const usdcAmount = await this.swapPricing.getFromBtcSwapAmount(btcValueToSwap, this.tokenAddresses.USDC, false);
+                    if(usdcAmount.gt(usableBalanceUSDC)) {
+                        return;
+                    }
+                    console.log("[Hedging plugin: Check pools] Should initiate swap from USDC -> BTC, amount: ", usdcAmount.toString());
+
+                    this.state = {state: null};
+                    this.state.srcToken = "USDC";
+                    this.state.srcTokenAddress = this.tokenAddresses["USDC"];
+                    this.state.dstToken = "BTC";
+                    this.state.dstTokenAddress = "";
+                    this.state.amountOut = usdcAmount;
+                    await this.setState(RebalancingState.TRIGGERED);
+
+                }
+            }
+
+        }, 120000);
 
     }
 
@@ -865,8 +1017,18 @@ export class HedgingPlugin<T extends SwapData> implements IPlugin<T> {
     }
 
     async onServiceInitialize(service: SwapHandler<SwapHandlerSwap<T>, T>): Promise<void> {
-        if(service instanceof FromBtcLnAbs) this.fromBtcLn = service;
-        if(service instanceof FromBtcAbs) this.fromBtc = service;
+        if(service.type===SwapHandlerType.FROM_BTCLN) {
+            this.fromBtcLn = service as FromBtcLnAbs<T>;
+        }
+        if(service.type===SwapHandlerType.FROM_BTC) {
+            this.fromBtc = service as FromBtcAbs<T>;
+        }
+        if(service.type===SwapHandlerType.TO_BTCLN) {
+            this.toBtcLn = service as ToBtcLnAbs<T>;
+        }
+        if(service.type===SwapHandlerType.TO_BTC) {
+            this.toBtc = service as ToBtcAbs<T>;
+        }
     }
 
     onSwapStateChange(swap: SwapHandlerSwap<T>): Promise<void> {
